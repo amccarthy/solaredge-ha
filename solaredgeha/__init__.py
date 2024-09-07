@@ -1,1 +1,1 @@
-from .solaredgeha import SolaredgeHa
+from .solaredgeha import SolarEdgeHa

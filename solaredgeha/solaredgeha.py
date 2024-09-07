@@ -1,84 +1,87 @@
-import requests
 from xml.etree import ElementTree
 
+import logging
 
-LOGINURL = 'https://api.solaredge.com/solaredge-apigw/api'
-BASEURL = 'https://ha.monitoring.solaredge.com/api/homeautomation/v1.0'
+import aiohttp
+import yarl
 
-COOKIE_NAME = "SPRING_SECURITY_REMEMBER_ME_COOKIE"
+_LOGIN_URL = yarl.URL("https://api.solaredge.com/solaredge-apigw/api")
+_BASE_URL = yarl.URL("https://ha.monitoring.solaredge.com/api/homeautomation/v1.0")
 
+_COOKIE_NAME = "SPRING_SECURITY_REMEMBER_ME_COOKIE"
 
-class SolaredgeHa(object):
-    """
-    Object containing SolarEdge's Home Automation site API-methods.
-    """
+_LOGGER = logging.getLogger(__name__)
 
-    def __init__(self, username, password):
-        """
-        To communicate, you need to set a site and site token.
-        Get it from your account.
+class SolarEdgeHa:
+    """SolarEdgeHa API client."""
 
-        Parameters
-        ----------
-        username : str
-        password : str
-        """
+    def __init__(self, username: str, password: str,
+                 session: aiohttp.ClientSession | None = None, timeout: int = 10) -> None:
+        """Initialise the SolarEdge HA API client."""
         self.username = username
         self.password = password
+
+        self.session = session or aiohttp.ClientSession()
+        self._created_session = not session
+        self.timeout = timeout
 
         self.sites = []
         self.token = None
 
-    def login(self):
-        """
-        Login to service
+    async def close(self) -> None:
+        """Close the SolarEdge HA API client."""
+        if self._created_session:
+            await self.session.close()
 
-        Returns
-        -------
-        bool
-        """
+    async def login(self) -> bool:
+        """Login to service."""
 
-        url = urljoin(LOGINURL, "login")
+        url = _LOGIN_URL / "login"
 
         params = {
             "j_username": self.username,
             "j_password": self.password
         }
 
-        r = requests.post(url, data=params, allow_redirects=False)
+        _LOGGER.debug("Calling login")
+        response = await self.session.post(url, data=params, timeout=self.timeout, allow_redirects=False)
+        _LOGGER.debug("Response from %s: %s", url, response.status)
+        response.raise_for_status()
 
-        r.raise_for_status()
-
-        if (r.status_code != 302):
+        if (response.status != 302):
             return False
 
-        self.token = r.cookies.get(COOKIE_NAME)
+        self.token = response.cookies[_COOKIE_NAME].value
 
-        return self.updateSites()
+        _LOGGER.debug("Token: %s", self.token)
 
-    def updateSites(self):
-        """
-        Update available sites
+        return await self.update_sites()
 
-        Returns
-        -------
-        bool
-        """
-
+    async def update_sites(self) -> bool:
+        """Update available sites."""
         if (self.token == None):
             return False
 
-        url = urljoin(LOGINURL, "fields", "list")
+        url = _LOGIN_URL / "fields" / "list"
+        _LOGGER.debug("URL: %s", url)
 
         cookies = {
-            COOKIE_NAME: self.token
+            _COOKIE_NAME: self.token
         }
 
-        r = requests.get(url, cookies=cookies)
+        _LOGGER.debug("Calling fields/list")
+        response = await self.session.get(url, cookies=cookies)
+        _LOGGER.debug("Response from %s: %s", url, response.status)
+        response.raise_for_status()
 
-        r.raise_for_status()
+        if (response.status != 200):
+            self.sites = []
+            return False
 
-        tree = ElementTree.fromstring(r.content)
+        content = await response.text()
+        # _LOGGER.debug("Response: %s", content)
+
+        tree = ElementTree.fromstring(content)
 
         self.sites = []
         for id in tree.iter('id'):
@@ -86,61 +89,48 @@ class SolaredgeHa(object):
 
         return True
 
-    def ensureSession(self):
+    async def ensure_session(self) -> bool:
         if (self.token == None):
-            self.login()
+            await self.login()
 
         return self.token != None
 
-    def get_sites(self):
-        """
-        Get list of site ids
-
-        Returns
-        -------
-        list
-        """
+    def get_sites(self) -> []:
+        """Get list of site ids."""
 
         return self.sites
 
-    def get_devices(self, site):
-        """
-        Request devices
+    async def get_devices(self, site) -> dict:
+        """Request devices."""
 
-        Returns
-        -------
-        dict
-        """
-
-        if (self.ensureSession() == False):
+        if (await self.ensure_session() == False):
             return None
 
-        url = urljoin(BASEURL, "sites", site, "devices")
+        url = _BASE_URL / "sites" / site / "devices"
 
         cookies = {
-            COOKIE_NAME: self.token
+            _COOKIE_NAME: self.token
         }
 
-        r = requests.get(url, cookies=cookies)
-        r.raise_for_status()
-        return r.json()
+        response = await self.session.get(url, cookies=cookies)
+        _LOGGER.debug("Response from %s: %s", url, response.status)
+        response.raise_for_status()
 
-    def activate_device(self, reporterId, level, duration=None):
-        """
-        Activate devices
+        if (response.status != 200):
+            return {}
 
-        Returns
-        -------
-        dict
-        """
+        return await response.json()
 
-        if (self.ensureSession() == False):
+    async def activate_device(self, reporterId, level, duration=None) -> dict:
+        """Activate devices."""
+
+        if (await self.ensure_session() == False):
             return None
 
-        url = urljoin(BASEURL, self.sites[0], "devices", reporterId, "activationState")
+        url = _BASE_URL / self.sites[0] / "devices" / str(reporterId) / "activationState"
 
         cookies = {
-            COOKIE_NAME: self.token
+            _COOKIE_NAME: self.token
         }
 
         params = {
@@ -149,33 +139,12 @@ class SolaredgeHa(object):
             "duration": duration
         }
 
-        r = requests.put(url, json=params, cookies=cookies)
-        r.raise_for_status()
-        return r.json()
+        response = await self.session.put(url, json=params, cookies=cookies)
+        _LOGGER.debug("Response from %s: %s", url, response.status)
+        response.raise_for_status()
 
+        if (response.status != 200):
+            return {}
 
-def urljoin(*parts):
-    """
-    Join terms together with forward slashes
+        return await response.json()
 
-    Parameters
-    ----------
-    parts
-
-    Returns
-    -------
-    str
-    """
-    # first strip extra forward slashes (except http:// and the likes) and
-    # create list
-    part_list = []
-    for part in parts:
-        p = str(part)
-        if p.endswith('//'):
-            p = p[0:-1]
-        else:
-            p = p.strip('/')
-        part_list.append(p)
-    # join everything together
-    url = '/'.join(part_list)
-    return url
